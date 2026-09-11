@@ -26,7 +26,7 @@ A Vue 3 and Supabase application for protected beta reading.
 4. Run the query once.
 5. In Authentication email templates, configure the Magic Link template to display `{{ .Token }}` so users receive a verification code.
 
-The owner email is `teejayedeloachwrites@gmail.com`. It automatically receives the administrator role.
+The owner email is `teejayedeloach@teejayedeloach.com`. It automatically receives the administrator role.
 
 ## Netlify environment variables
 
