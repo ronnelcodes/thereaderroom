@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Bell, BookOpen, Check, ChevronLeft, ChevronRight, FileText, Gauge, Inbox, LayoutDashboard, LockKeyhole, LogOut, Menu, MessageSquare, MoreHorizontal, Plus, Send, Settings, ShieldCheck, Sparkles, Upload, Users, X } from 'lucide-vue-next'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 
-const OWNER_EMAIL = 'teejayedeloachwrites@gmail.com'
+const OWNER_EMAIL = 'teejayedeloach@teejayedeloach.com'
 const loading = ref(true), actionLoading = ref(false)
 const session = ref(null), profile = ref(null)
 const authEmail = ref(''), authCode = ref(''), codeSent = ref(false), authError = ref(''), errorMessage = ref('')
