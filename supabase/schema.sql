@@ -19,6 +19,18 @@ create table public.profiles (
 
 create unique index profiles_email_lower_idx on public.profiles (lower(email));
 
+create table public.author_invitations (
+  id uuid primary key default gen_random_uuid(),
+  email text not null,
+  invited_by uuid not null references public.profiles(id) on delete cascade,
+  status text not null default 'pending' check (status in ('pending','accepted','revoked')),
+  invited_at timestamptz not null default now(),
+  accepted_at timestamptz,
+  revoked_at timestamptz
+);
+
+create unique index author_invitations_email_lower_idx on public.author_invitations (lower(email));
+
 create table public.books (
   id uuid primary key default gen_random_uuid(),
   author_id uuid not null references public.profiles(id) on delete cascade,
@@ -199,7 +211,14 @@ begin
     new.id,
     lower(new.email),
     coalesce(new.raw_user_meta_data ->> 'full_name', split_part(new.email, '@', 1)),
-    case when lower(new.email) = 'teejayedeloach@teejayedeloach.com' then 'admin'::public.user_role else 'reader'::public.user_role end
+    case
+      when lower(new.email) = 'thereaderroom@teejayedeloach.com' then 'admin'::public.user_role
+      when exists (
+        select 1 from public.author_invitations ai
+        where lower(ai.email) = lower(new.email) and ai.revoked_at is null
+      ) then 'author'::public.user_role
+      else 'reader'::public.user_role
+    end
   )
   on conflict (id) do update set email = excluded.email;
 
@@ -207,6 +226,10 @@ begin
   set reader_id = new.id,
       status = case when status = 'pending' then 'accepted'::public.invitation_status else status end,
       accepted_at = coalesce(accepted_at, now())
+  where lower(email) = lower(new.email) and revoked_at is null;
+
+  update public.author_invitations
+  set status = 'accepted', accepted_at = coalesce(accepted_at, now())
   where lower(email) = lower(new.email) and revoked_at is null;
   return new;
 end;
@@ -218,11 +241,11 @@ for each row execute function public.handle_new_user();
 
 insert into public.profiles (id, email, full_name, role)
 select id, lower(email), coalesce(raw_user_meta_data ->> 'full_name', split_part(email, '@', 1)),
-       case when lower(email) = 'teejayedeloach@teejayedeloach.com' then 'admin'::public.user_role else 'reader'::public.user_role end
+       case when lower(email) = 'thereaderroom@teejayedeloach.com' then 'admin'::public.user_role else 'reader'::public.user_role end
 from auth.users
 on conflict (id) do update set
   email = excluded.email,
-  role = case when excluded.email = 'teejayedeloach@teejayedeloach.com' then 'admin'::public.user_role else public.profiles.role end;
+  role = case when excluded.email = 'thereaderroom@teejayedeloach.com' then 'admin'::public.user_role else public.profiles.role end;
 
 create or replace function public.is_admin()
 returns boolean language sql stable security definer set search_path = public
@@ -231,6 +254,53 @@ as $$ select exists(select 1 from public.profiles where id = auth.uid() and role
 create or replace function public.is_author()
 returns boolean language sql stable security definer set search_path = public
 as $$ select exists(select 1 from public.profiles where id = auth.uid() and role in ('admin','author')) $$;
+
+create or replace function public.can_use_author_portal(candidate_email text)
+returns boolean language sql stable security definer set search_path = public
+as $$
+  select lower(candidate_email) = 'thereaderroom@teejayedeloach.com'
+    or exists(
+      select 1 from public.author_invitations
+      where lower(email) = lower(candidate_email) and revoked_at is null
+    )
+$$;
+
+create or replace function public.can_use_reader_portal(candidate_email text)
+returns boolean language sql stable security definer set search_path = public
+as $$
+  select exists(
+    select 1 from public.reader_invitations
+    where lower(email) = lower(candidate_email) and revoked_at is null
+  )
+$$;
+
+create or replace function public.invite_author(author_email text)
+returns void language plpgsql security definer set search_path = public
+as $$
+begin
+  if not public.is_admin() then raise exception 'Administrator access required'; end if;
+  insert into public.author_invitations (email, invited_by)
+  values (lower(trim(author_email)), auth.uid())
+  on conflict ((lower(email))) do update
+  set status = 'pending', invited_by = auth.uid(), invited_at = now(), accepted_at = null, revoked_at = null;
+  update public.profiles set role = 'author'::public.user_role
+  where lower(email) = lower(trim(author_email));
+end;
+$$;
+
+create or replace function public.revoke_author(invitation_id uuid)
+returns void language plpgsql security definer set search_path = public
+as $$
+declare target_email text;
+begin
+  if not public.is_admin() then raise exception 'Administrator access required'; end if;
+  update public.author_invitations
+  set status = 'revoked', revoked_at = now()
+  where id = invitation_id returning email into target_email;
+  update public.profiles set role = 'reader'::public.user_role
+  where lower(email) = lower(target_email) and lower(email) <> 'thereaderroom@teejayedeloach.com';
+end;
+$$;
 
 create or replace function public.set_user_role(target_user uuid, new_role public.user_role)
 returns void
@@ -259,6 +329,7 @@ as $$
 $$;
 
 alter table public.profiles enable row level security;
+alter table public.author_invitations enable row level security;
 alter table public.books enable row level security;
 alter table public.manuscript_versions enable row level security;
 alter table public.chapters enable row level security;
@@ -274,6 +345,8 @@ alter table public.access_logs enable row level security;
 
 create policy profiles_self_select on public.profiles for select to authenticated using (id = auth.uid() or public.is_admin());
 create policy profiles_self_update on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
+create policy author_invitations_admin_all on public.author_invitations for all to authenticated
+using (public.is_admin()) with check (public.is_admin());
 
 create policy books_read on public.books for select to authenticated using (public.can_read_book(id));
 create policy books_author_insert on public.books for insert to authenticated with check (author_id = auth.uid() and public.is_author());
@@ -311,7 +384,7 @@ create policy reminders_author_all on public.reminder_settings for all to authen
 create policy access_logs_self_insert on public.access_logs for insert to authenticated with check (user_id = auth.uid());
 create policy access_logs_author_read on public.access_logs for select to authenticated using (user_id = auth.uid() or exists(select 1 from public.books b where b.id = book_id and (b.author_id = auth.uid() or public.is_admin())));
 
-revoke all on public.profiles, public.books, public.manuscript_versions, public.chapters,
+revoke all on public.profiles, public.author_invitations, public.books, public.manuscript_versions, public.chapters,
   public.reader_invitations, public.reader_agreements, public.reading_progress,
   public.comments, public.questionnaires, public.questionnaire_questions,
   public.questionnaire_responses, public.reminder_settings, public.access_logs
@@ -319,6 +392,7 @@ from anon, authenticated;
 
 grant select on public.profiles to authenticated;
 grant update (full_name) on public.profiles to authenticated;
+grant select, insert, update, delete on public.author_invitations to authenticated;
 grant select, insert, update, delete on public.books, public.manuscript_versions, public.chapters,
   public.reader_invitations, public.reader_agreements, public.reading_progress,
   public.comments, public.questionnaires, public.questionnaire_questions,
@@ -326,6 +400,8 @@ grant select, insert, update, delete on public.books, public.manuscript_versions
 to authenticated;
 grant usage, select on sequence public.access_logs_id_seq to authenticated;
 grant execute on function public.is_admin(), public.is_author(), public.can_read_book(uuid), public.set_user_role(uuid, public.user_role) to authenticated;
+grant execute on function public.can_use_author_portal(text), public.can_use_reader_portal(text) to anon, authenticated;
+grant execute on function public.invite_author(text), public.revoke_author(uuid) to authenticated;
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('manuscripts', 'manuscripts', false, 20971520, array['application/vnd.openxmlformats-officedocument.wordprocessingml.document','text/plain','application/pdf'])

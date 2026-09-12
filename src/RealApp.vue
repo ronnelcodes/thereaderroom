@@ -3,12 +3,15 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Bell, BookOpen, Check, ChevronLeft, ChevronRight, FileText, Gauge, Inbox, LayoutDashboard, LockKeyhole, LogOut, Menu, MessageSquare, MoreHorizontal, Plus, Send, Settings, ShieldCheck, Sparkles, Upload, Users, X } from 'lucide-vue-next'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 
-const OWNER_EMAIL = 'teejayedeloach@teejayedeloach.com'
+const OWNER_EMAIL = 'thereaderroom@teejayedeloach.com'
+const initialPortal = window.location.pathname.startsWith('/author-login') ? 'author' : window.location.pathname.startsWith('/reader-login') ? 'reader' : 'choice'
 const loading = ref(true), actionLoading = ref(false)
 const session = ref(null), profile = ref(null)
+const portal = ref(initialPortal)
 const authEmail = ref(''), authCode = ref(''), codeSent = ref(false), authError = ref(''), errorMessage = ref('')
 const activeView = ref('dashboard'), mobileNav = ref(false), toast = ref('')
 const books = ref([]), invitations = ref([]), feedback = ref([]), chapters = ref([])
+const authorInvitations = ref([]), newAuthorEmail = ref('')
 const selectedBook = ref(null), selectedChapter = ref(null)
 const showNewBook = ref(false), showInvite = ref(false), showReader = ref(false), showAgreement = ref(false), showComment = ref(false), showNotice = ref(false)
 const selectedSentence = ref(''), selectedSentenceIndex = ref(null), commentText = ref('')
@@ -21,6 +24,7 @@ const nav = [
   {id:'readers',label:'Readers',icon:Users},{id:'feedback',label:'Feedback',icon:MessageSquare},{id:'settings',label:'Settings',icon:Settings}
 ]
 const isAuthor = computed(()=>['admin','author'].includes(profile.value?.role))
+const wrongPortal = computed(()=>session.value&&profile.value&&((portal.value==='author'&&!isAuthor.value)||(portal.value==='reader'&&isAuthor.value)))
 const pageTitle = computed(()=>nav.find(i=>i.id===activeView.value)?.label||'Overview')
 const activeBooks = computed(()=>books.value.filter(b=>b.status==='active'))
 const activeReaders = computed(()=>invitations.value.filter(i=>!i.revoked_at&&i.status!=='revoked'))
@@ -31,11 +35,16 @@ const chapterSentences = computed(()=> (selectedChapter.value?.content||'').spli
 
 function flash(message){toast.value=message;setTimeout(()=>toast.value='',2800)}
 function changeView(id){activeView.value=id;mobileNav.value=false}
+function selectPortal(kind){portal.value=kind;authEmail.value='';authCode.value='';codeSent.value=false;authError.value='';window.history.replaceState({},'',kind==='author'?'/author-login':'/reader-login')}
+function portalHome(){portal.value='choice';authEmail.value='';authCode.value='';codeSent.value=false;authError.value='';window.history.replaceState({},'','/')}
 
 async function sendCode(){
-  authError.value=''; if(!authEmail.value.trim())return
+  authError.value=''; if(!authEmail.value.trim()||portal.value==='choice')return
   actionLoading.value=true
-  const {error}=await supabase.auth.signInWithOtp({email:authEmail.value.trim().toLowerCase(),options:{shouldCreateUser:true,data:{full_name:authEmail.value.split('@')[0]}}})
+  const email=authEmail.value.trim().toLowerCase()
+  const gate=await supabase.rpc(portal.value==='author'?'can_use_author_portal':'can_use_reader_portal',{candidate_email:email})
+  if(gate.error||!gate.data){actionLoading.value=false;authError.value=portal.value==='author'?'This email has not been invited as an author.':'No active reader invitation was found for this email.';return}
+  const {error}=await supabase.auth.signInWithOtp({email,options:{shouldCreateUser:true,data:{full_name:email.split('@')[0]}}})
   actionLoading.value=false; if(error)authError.value=error.message;else codeSent.value=true
 }
 async function verifyCode(){
@@ -49,8 +58,12 @@ async function loadWorkspace(){
   if(!session.value)return;loading.value=true;errorMessage.value=''
   try{
     const {data:p,error:pe}=await supabase.from('profiles').select('*').eq('id',session.value.user.id).single();if(pe)throw pe;profile.value=p
-    if(['admin','author'].includes(p.role))await loadAuthorData();else await loadReaderData()
+    if(portal.value==='choice')portal.value=['admin','author'].includes(p.role)?'author':'reader'
+    if(['admin','author'].includes(p.role)){await loadAuthorData();if(p.role==='admin')await loadAuthorInvitations()}else await loadReaderData()
   }catch(error){errorMessage.value=error.message||'The workspace could not be loaded.'}finally{loading.value=false}
+}
+async function loadAuthorInvitations(){
+  const {data,error}=await supabase.from('author_invitations').select('*').order('invited_at',{ascending:false});if(error)throw error;authorInvitations.value=data||[]
 }
 async function loadAuthorData(){
   const {data:b,error}=await supabase.from('books').select('*').order('updated_at',{ascending:false});if(error)throw error;books.value=b||[]
@@ -94,6 +107,15 @@ async function inviteReader(){
   if(error)flash(error.message);else{showInvite.value=false;await loadAuthorData();flash('Reader access created. Email automation is the next setup phase.')}
 }
 async function revokeInvitation(i){const {error}=await supabase.from('reader_invitations').update({status:'revoked',revoked_at:new Date().toISOString()}).eq('id',i.id);if(error)flash(error.message);else{await loadAuthorData();flash('Reader access revoked.')}}
+async function inviteAuthor(){
+  const email=newAuthorEmail.value.trim().toLowerCase();if(!email)return
+  actionLoading.value=true;const {error}=await supabase.rpc('invite_author',{author_email:email});actionLoading.value=false
+  if(error)flash(error.message);else{newAuthorEmail.value='';await loadAuthorInvitations();flash('Author access created.')}
+}
+async function revokeAuthor(invitation){
+  actionLoading.value=true;const {error}=await supabase.rpc('revoke_author',{invitation_id:invitation.id});actionLoading.value=false
+  if(error)flash(error.message);else{await loadAuthorInvitations();flash('Author access revoked.')}
+}
 
 async function openBook(book,invitation=null){
   selectedBook.value=book;const {data,error}=await supabase.from('chapters').select('*').eq('book_id',book.id).eq('version_number',book.current_version||1).order('chapter_number');if(error)return flash(error.message)
@@ -134,25 +156,43 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',blockAction);window.re
   <div v-else-if="!isSupabaseConfigured" class="center-screen error-screen"><ShieldCheck :size="34"/><h1>Connection needed</h1><p>Add the Supabase project URL and publishable key to the Netlify environment.</p></div>
 
   <main v-else-if="!session" class="auth-page">
-    <section class="auth-brand"><div class="brand-mark large">V<span>&</span>V</div><p class="eyebrow">VIBE & VISION COLLECTIVE</p><h1>The Reader Room</h1><p>A protected place for meaningful stories, trusted readers, and feedback that helps the work grow.</p><div class="auth-promise"><ShieldCheck/><span>Private manuscripts<small>Personalized access and accountable feedback</small></span></div></section>
-    <section class="auth-card"><div v-if="!codeSent"><p class="eyebrow">WELCOME</p><h2>Enter the room.</h2><p>We’ll email you a one-time verification code. No password required.</p><label>Email address<input v-model="authEmail" type="email" autocomplete="email" placeholder="you@example.com" @keyup.enter="sendCode"/></label><button class="primary full" :disabled="actionLoading" @click="sendCode">{{actionLoading?'Sending…':'Email my code'}} <ChevronRight :size="17"/></button></div><div v-else><button class="text-button auth-back" @click="codeSent=false;authCode=''">← Change email</button><p class="eyebrow">CHECK YOUR EMAIL</p><h2>Enter your code.</h2><p>We sent a code to <strong>{{authEmail}}</strong>.</p><label>Verification code<input v-model="authCode" class="code-input" inputmode="numeric" maxlength="8" placeholder="000000" @keyup.enter="verifyCode"/></label><button class="primary full" :disabled="actionLoading" @click="verifyCode">{{actionLoading?'Verifying…':'Enter The Reader Room'}}</button></div><p v-if="authError" class="form-error">{{authError}}</p><small class="auth-terms">By continuing, you agree to respect manuscript confidentiality and the creative work shared here.</small></section>
+    <section class="auth-brand"><img class="auth-primary-logo" src="/assets/reader-room-primary-logo.svg?v=2" alt="The Reader Room, where stories meet their first readers"/><p>A protected place for meaningful stories, trusted readers, and feedback that helps the work grow.</p><div class="auth-promise"><ShieldCheck/><span>Private manuscripts<small>Personalized access and accountable feedback</small></span></div></section>
+    <section class="auth-card">
+      <img class="auth-card-logo" src="/assets/reader-room-primary-logo.svg?v=2" alt="The Reader Room"/>
+      <div v-if="portal==='choice'" class="portal-choice">
+        <p class="eyebrow">TWO PORTALS, ONE CREATIVE COMMUNITY</p><h2>How are you entering?</h2><p class="portal-intro">Choose the portal that matches your invitation. Authors and beta readers have separate, protected workspaces.</p>
+        <div class="portal-choice-grid">
+          <button class="portal-option author-portal" @click="selectPortal('author')"><span class="portal-icon"><BookOpen/></span><span class="portal-copy"><small>AUTHOR PORTAL</small><strong>I’m an Author</strong><span>Upload manuscripts, invite readers, and review feedback.</span></span><span class="portal-action">Author sign in <ChevronRight/></span></button>
+          <button class="portal-option reader-portal" @click="selectPortal('reader')"><span class="portal-icon"><Users/></span><span class="portal-copy"><small>BETA READER PORTAL</small><strong>I’m a Beta Reader</strong><span>Open an invited manuscript, read securely, and leave feedback.</span></span><span class="portal-action">Reader sign in <ChevronRight/></span></button>
+        </div>
+        <p class="portal-help"><LockKeyhole :size="14"/> Access is by invitation only. Use the email address that received your invitation.</p>
+      </div>
+      <div v-else-if="!codeSent">
+        <button class="text-button auth-back" @click="portalHome">← Choose another entrance</button><p class="eyebrow">{{portal==='author'?'AUTHOR PORTAL':'READER PORTAL'}}</p><h2>{{portal==='author'?'Manage your work.':'Open your reading shelf.'}}</h2><p>Enter the exact email address that received your invitation. We’ll send a one-time verification code.</p><label>Email address<input v-model="authEmail" type="email" autocomplete="email" placeholder="you@example.com" @keyup.enter="sendCode"/></label><button class="primary full" :disabled="actionLoading" @click="sendCode">{{actionLoading?'Checking…':'Email my code'}} <ChevronRight :size="17"/></button>
+      </div>
+      <div v-else>
+        <button class="text-button auth-back" @click="codeSent=false;authCode=''">← Change email</button><p class="eyebrow">CHECK YOUR EMAIL</p><h2>Enter your code.</h2><p>We sent a code to <strong>{{authEmail}}</strong>.</p><label>Verification code<input v-model="authCode" class="code-input" inputmode="numeric" maxlength="8" placeholder="000000" @keyup.enter="verifyCode"/></label><button class="primary full" :disabled="actionLoading" @click="verifyCode">{{actionLoading?'Verifying…':'Enter The Reader Room'}}</button>
+      </div>
+      <p v-if="authError" class="form-error">{{authError}}</p><small v-if="portal!=='choice'" class="auth-terms">By continuing, you agree to respect manuscript confidentiality and the creative work shared here.</small>
+    </section>
   </main>
 
+  <div v-else-if="wrongPortal" class="center-screen error-screen"><ShieldCheck :size="34"/><h1>Use the correct entrance</h1><p>{{isAuthor?'This account belongs in the author portal.':'This email has not been approved for author access.'}}</p><button class="primary" @click="signOut">Return to sign in</button></div>
   <div v-else-if="errorMessage" class="center-screen error-screen"><ShieldCheck :size="34"/><h1>Setup is not finished</h1><p>{{errorMessage}}</p><p>Run the Reader Room database setup in Supabase, then try again.</p><button class="primary" @click="loadWorkspace">Try again</button></div>
 
   <div v-else-if="!isAuthor" class="reader-home">
-    <header class="reader-home-header"><div class="brand"><div class="brand-mark">V<span>&</span>V</div><div><strong>THE READER ROOM</strong><small>Vibe & Vision Collective</small></div></div><div><span>{{readerEmail}}</span><button class="secondary" @click="signOut"><LogOut :size="16"/> Sign out</button></div></header>
+    <header class="reader-home-header"><div class="brand"><img class="brand-icon" src="/assets/reader-room-icon.svg" alt=""/><div><strong>THE READER ROOM</strong><small>Vibe & Vision Collective</small></div></div><div><span>{{readerEmail}}</span><button class="secondary" @click="signOut"><LogOut :size="16"/> Sign out</button></div></header>
     <main class="reader-library"><p class="eyebrow">YOUR READING SHELF</p><h1>Welcome to The Reader Room.</h1><p>Your invited manuscripts appear here. Feedback from other readers is never shown to you.</p><section v-if="readerInvitations.length" class="reader-book-grid"><article v-for="invite in readerInvitations" :key="invite.id" class="reader-book"><div class="book-cover large holiday"><BookOpen/></div><div><span class="status" :class="invite.status">{{invite.status}}</span><h2>{{invite.books?.title}}</h2><p>{{invite.books?.author_name}}</p><small>Deadline: {{invite.individual_deadline||invite.books?.overall_deadline||'Set by author'}}</small><button class="primary" :disabled="invite.status==='revoked'" @click="openBook(invite.books,invite)">Continue reading <ChevronRight :size="16"/></button></div></article></section><section v-else class="panel empty-state"><Inbox :size="34"/><h2>No invitations yet</h2><p>Sign in with the exact email address the author invited.</p></section></main>
   </div>
 
   <div v-else class="app-shell">
-    <aside class="sidebar" :class="{open:mobileNav}"><button class="mobile-close" @click="mobileNav=false"><X/></button><div class="brand"><div class="brand-mark">V<span>&</span>V</div><div><strong>THE READER ROOM</strong><small>Vibe & Vision Collective</small></div></div><nav><button v-for="item in nav" :key="item.id" :class="{active:activeView===item.id}" @click="changeView(item.id)"><component :is="item.icon" :size="19"/><span>{{item.label}}</span><span v-if="item.id==='feedback'&&newFeedback.length" class="nav-count">{{newFeedback.length}}</span></button></nav><div class="collective-card"><Sparkles :size="18"/><strong>Creative community</strong><p>A protected space centered on LGBTQ+ stories and the people who shape them.</p></div><div class="profile-chip"><div class="avatar plum">{{(profile?.full_name||'TR').slice(0,2).toUpperCase()}}</div><div><strong>{{profile?.full_name}}</strong><small>{{profile?.role}}</small></div><button class="bare-icon" @click="signOut"><LogOut :size="17"/></button></div></aside>
+    <aside class="sidebar" :class="{open:mobileNav}"><button class="mobile-close" @click="mobileNav=false"><X/></button><div class="brand"><img class="brand-icon" src="/assets/reader-room-icon.svg" alt=""/><div><strong>THE READER ROOM</strong><small>Vibe & Vision Collective</small></div></div><nav><button v-for="item in nav" :key="item.id" :class="{active:activeView===item.id}" @click="changeView(item.id)"><component :is="item.icon" :size="19"/><span>{{item.label}}</span><span v-if="item.id==='feedback'&&newFeedback.length" class="nav-count">{{newFeedback.length}}</span></button></nav><div class="collective-card"><Sparkles :size="18"/><strong>Creative community</strong><p>A protected space centered on LGBTQ+ stories and the people who shape them.</p></div><div class="profile-chip"><div class="avatar plum">{{(profile?.full_name||'TR').slice(0,2).toUpperCase()}}</div><div><strong>{{profile?.full_name}}</strong><small>{{profile?.role}}</small></div><button class="bare-icon" @click="signOut"><LogOut :size="17"/></button></div></aside>
     <main><header class="topbar"><button class="menu-button" @click="mobileNav=true"><Menu/></button><div><p class="eyebrow">AUTHOR WORKSPACE</p><h1>{{pageTitle}}</h1></div><div class="top-actions"><button class="icon-button"><Bell :size="19"/></button><button class="primary" @click="showNewBook=true"><Plus :size="18"/> New book</button></div></header>
       <section v-if="activeView==='dashboard'" class="content"><div class="welcome-row"><div><h2>Good to see you, {{profile?.full_name?.split(' ')[0]}}.</h2><p>{{newFeedback.length}} feedback notes are waiting for review.</p></div></div><div class="metric-grid"><article><span class="metric-icon violet"><BookOpen/></span><div><small>ACTIVE BOOKS</small><strong>{{activeBooks.length}}</strong><p>{{books.length}} total projects</p></div></article><article><span class="metric-icon teal"><Users/></span><div><small>ACTIVE READERS</small><strong>{{activeReaders.length}}</strong><p>Across your books</p></div></article><article><span class="metric-icon gold"><MessageSquare/></span><div><small>FEEDBACK</small><strong>{{feedback.length}}</strong><p>{{newFeedback.length}} need review</p></div></article><article><span class="metric-icon rose"><Gauge/></span><div><small>READER LIMIT</small><strong>10</strong><p>Per book</p></div></article></div><section class="panel projects-panel"><div class="panel-head"><div><p class="eyebrow">MANUSCRIPTS</p><h3>Your books</h3></div><button class="text-button" @click="changeView('books')">View all <ChevronRight :size="16"/></button></div><div v-if="!books.length" class="empty-state compact"><BookOpen/><h3>No books yet</h3><p>Upload your first manuscript to begin.</p><button class="primary" @click="showNewBook=true">Add manuscript</button></div><div v-for="book in books.slice(0,4)" :key="book.id" class="book-row"><div class="book-cover holiday"><BookOpen :size="18"/></div><div class="book-info"><h4>{{book.title}}</h4><p>{{book.genre||'Genre not set'}} · {{book.status}}</p></div><div class="book-stat"><strong>{{invitations.filter(i=>i.book_id===book.id&&!i.revoked_at).length}}/10</strong><small>readers</small></div><button class="secondary small-button" @click="openBook(book)">Preview</button></div></section></section>
       <section v-else-if="activeView==='books'" class="content"><div class="welcome-row"><div><h2>Manuscript projects</h2><p>Upload a Word document or paste your manuscript text.</p></div><button class="primary" @click="showNewBook=true"><Plus :size="18"/> Add book</button></div><div v-if="books.length" class="book-card-grid"><article v-for="book in books" :key="book.id" class="panel book-card"><div class="book-card-top"><div class="book-cover large holiday"><BookOpen/></div><span class="status" :class="book.status">{{book.status}}</span></div><p class="eyebrow">{{book.genre||'MANUSCRIPT'}}</p><h3>{{book.title}}</h3><p class="book-byline">{{book.author_name}}</p><div class="card-footer"><span><Users :size="16"/> {{invitations.filter(i=>i.book_id===book.id&&!i.revoked_at).length}}/10</span><button class="secondary" @click="startInvite(book.id)"><Send :size="15"/> Invite</button><button class="primary" @click="openBook(book)">Open</button></div></article></div><div v-else class="panel empty-state"><BookOpen/><h2>Your shelf is empty</h2><p>Create your first project with a DOCX file or pasted manuscript.</p><button class="primary" @click="showNewBook=true">Add your first book</button></div></section>
       <section v-else-if="activeView==='readers'" class="content"><div class="welcome-row"><div><h2>Reader directory</h2><p>Manage access separately for every manuscript.</p></div><button class="primary" :disabled="!books.length" @click="startInvite()"><Send :size="18"/> Invite reader</button></div><section class="panel data-panel"><div v-if="!invitations.length" class="empty-state"><Users/><h2>No readers invited</h2></div><template v-else><div class="reader-table-head"><span>READER</span><span>BOOK</span><span>STATUS</span><span>DEADLINE</span><span></span></div><div v-for="invite in invitations" :key="invite.id" class="reader-row"><div class="reader-cell"><span class="avatar">{{invite.email.slice(0,2).toUpperCase()}}</span><div><strong>{{invite.email}}</strong><small>{{invite.reader_id?'Account connected':'Waiting for sign-in'}}</small></div></div><span>{{books.find(b=>b.id===invite.book_id)?.title}}</span><span class="status" :class="invite.status">{{invite.status}}</span><small>{{invite.individual_deadline||'No date'}}</small><button v-if="!invite.revoked_at" class="danger-link" @click="revokeInvitation(invite)">Revoke</button></div></template></section></section>
       <section v-else-if="activeView==='feedback'" class="content"><div class="welcome-row"><div><h2>Feedback inbox</h2><p>Every note is tied to the reader who submitted it.</p></div></div><div v-if="feedback.length" class="feedback-list"><article v-for="item in feedback" :key="item.id" class="panel feedback-card"><div class="feedback-meta"><div class="reader-cell"><span class="avatar">{{(item.profiles?.full_name||item.profiles?.email||'R').slice(0,2).toUpperCase()}}</span><div><strong>{{item.profiles?.full_name||item.profiles?.email}}</strong><small>{{item.books?.title}} · {{item.chapters?.title}}</small></div></div><small>{{new Date(item.created_at).toLocaleDateString()}}</small></div><blockquote>“{{item.quoted_text}}”</blockquote><p>{{item.comment_text}}</p><div class="feedback-actions"><select :value="item.status" @change="updateStatus(item,$event.target.value)"><option v-for="s in ['new','consider','revise','accepted','dismissed']" :key="s" :value="s">{{s}}</option></select></div></article></div><div v-else class="panel empty-state"><MessageSquare/><h2>No feedback yet</h2><p>Reader comments will appear here.</p></div></section>
-      <section v-else class="content"><div class="welcome-row"><div><h2>Workspace settings</h2><p>Your security controls apply to every reading session.</p></div></div><div class="settings-grid"><section class="panel settings-card"><h3>Manuscript protection</h3><div class="setting-confirm"><Check/> Author and reader watermark</div><div class="setting-confirm"><Check/> Copying and printing blocked</div><div class="setting-confirm"><Check/> Confidentiality agreement required</div></section><section class="panel settings-card"><h3>Owner account</h3><p>{{OWNER_EMAIL}}</p><p class="muted-copy">New accounts default to reader access.</p></section></div></section>
+      <section v-else class="content"><div class="welcome-row"><div><h2>Workspace settings</h2><p>Your security controls apply to every reading session.</p></div></div><div class="settings-grid"><section class="panel settings-card"><h3>Manuscript protection</h3><div class="setting-confirm"><Check/> Author and reader watermark</div><div class="setting-confirm"><Check/> Copying and printing blocked</div><div class="setting-confirm"><Check/> Confidentiality agreement required</div></section><section class="panel settings-card"><h3>Owner account</h3><p>{{OWNER_EMAIL}}</p><p class="muted-copy">New accounts receive access only through an author or reader invitation.</p></section><section v-if="profile?.role==='admin'" class="panel settings-card author-access-card"><h3>Author access</h3><p>Invite authors individually. Only approved email addresses can use the author portal.</p><form class="inline-invite" @submit.prevent="inviteAuthor"><input v-model="newAuthorEmail" type="email" placeholder="author@example.com" aria-label="Author email"/><button class="primary" :disabled="actionLoading">Invite author</button></form><div v-if="authorInvitations.length" class="author-invite-list"><div v-for="invite in authorInvitations" :key="invite.id"><span><strong>{{invite.email}}</strong><small>{{invite.status}}</small></span><button v-if="!invite.revoked_at" class="danger-link" @click="revokeAuthor(invite)">Revoke</button></div></div><p v-else class="muted-copy">No other authors have been invited.</p></section></div></section>
     </main>
   </div>
 

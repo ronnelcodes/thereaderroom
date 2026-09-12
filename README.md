@@ -26,7 +26,11 @@ A Vue 3 and Supabase application for protected beta reading.
 4. Run the query once.
 5. In Authentication email templates, configure the Magic Link template to display `{{ .Token }}` so users receive a verification code.
 
-The owner email is `teejayedeloach@teejayedeloach.com`. It automatically receives the administrator role.
+If the original schema was already installed before author invitations were added, run `supabase/add-author-invitations.sql` once.
+
+The owner email is `thereaderroom@teejayedeloach.com`. It automatically receives the administrator role.
+
+The public sign-in chooser routes approved authors to `/author-login` and invited beta readers to `/reader-login`. Administrators invite additional authors from Workspace Settings.
 
 ## Netlify environment variables
 
